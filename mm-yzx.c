@@ -71,6 +71,10 @@ static inline void* getbp(freenode_offset off)
 {
     return heap_start + off;
 }
+static inline freenode_offset getoffset(void* bp)
+{
+    return (freenode_offset) (bp - heap_start);
+}
 
 /*
  * Initialize: return -1 on error, 0 on success.
@@ -160,8 +164,10 @@ static freenode_offset get_leftmost_node( freenode_offset root )
  */
 static freenode_offset remove_freenode(freenode_offset root, freenode_offset node)
 {
-    if(root == 0)
+    if(root == 0) {
+        dbg_printf("should not remove nonexistent node\n");
         return 0;
+    }
     void *bp = getbp(root);
     void *nodep = getbp(node);
     if(root != node) {
@@ -189,10 +195,40 @@ static freenode_offset remove_freenode(freenode_offset root, freenode_offset nod
     }
 }
 
+/*
+ *
+ */
+static freenode_offset insert_freenode(freenode_offset root, freenode_offset node)
+{
+    if(root == 0)
+        return node;
+    void *bp = getbp(root);
+    void *nodep = getbp(node);
+    if(BLOCK_SIZE(nodep) < BLOCK_SIZE(bp)) {
+        LEFT_CHILD(bp) = insert_freenode(LEFT_CHILD(bp), node);
+    } else {
+        RIGHT_CHILD(bp) = insert_freenode(RIGHT_CHILD(bp), node);
+    }
+    return root;
+}
+
 static void place(void *bp, size_t size)
 {
-
-
+    assert(BLOCK_SIZE(bp) >= size);
+    size_t csize = BLOCK_SIZE(bp);
+    if(csize - size >= MINIMAL_BLOCKSIZE) {
+        PUT(HDRP(bp), PACK(size, 1));
+        PUT(FTRP(bp), PACK(size, 1));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK(csize - size, 0));
+        PUT(FTRP(bp), PACK(csize - size, 0));
+        LEFT_CHILD(bp) = 0;
+        RIGHT_CHILD(bp) = 0;
+        free_blocks_tree = insert_freenode(free_blocks_tree, getoffset(bp));
+    } else {
+        PUT(HDRP(bp), PACK(csize, 1));
+        PUT(FTRP(bp), PACK(csize, 1));
+    }
 }
 
 /*
