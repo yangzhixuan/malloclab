@@ -2,7 +2,7 @@
 # Makefile for the malloc lab driver
 #
 CC = gcc
-CFLAGS = -Wall -Wextra -g -DDRIVER -std=gnu99 
+CFLAGS = -Wall -Wextra -g -DDRIVER -std=gnu99 -O2
 
 OBJS = mdriver.o mm.o memlib.o fsecs.o fcyc.o clock.o ftimer.o 
 
@@ -21,6 +21,3 @@ clock.o: clock.c clock.h
 
 clean:
 	rm -f *~ *.o mdriver
-
-
-

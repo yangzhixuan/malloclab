@@ -112,13 +112,6 @@ static void *extend_heap(size_t words)
     return coalesce(bp);
 }
 
-/*
- * Coalesce adjacent free blocks.
- */
-static void* coalesce(void *bp)
-{
-    return bp;
-}
 
 /*
  * Search the free block tree for a best fit
@@ -176,6 +169,7 @@ static freenode_offset remove_freenode(freenode_offset root, freenode_offset nod
         } else {
             RIGHT_CHILD(bp) = remove_freenode(RIGHT_CHILD(bp), node);
         } 
+        return root;
     } else {
         if( RIGHT_CHILD(bp) == 0 ) {
             return LEFT_CHILD(bp);
@@ -232,6 +226,32 @@ static void place(void *bp, size_t size)
 }
 
 /*
+ * Coalesce adjacent free blocks.
+ */
+static void* coalesce(void *bp)
+{
+    void *prev;
+    void *next;
+    size_t size = BLOCK_SIZE(bp);
+    prev = PREV_BLKP(bp);
+    if(GET_ALLOC(HDRP(prev)) == 0) {
+        free_blocks_tree = remove_freenode(free_blocks_tree, getoffset(prev));
+        size += BLOCK_SIZE(prev);
+        PUT(HDRP(prev), PACK(size, 0));
+        PUT(FTRP(prev), PACK(size, 0));
+        bp = prev;
+    }
+    next = NEXT_BLKP(bp);
+    if(GET_ALLOC(HDRP(next)) == 0) {
+        free_blocks_tree = remove_freenode(free_blocks_tree, getoffset(next));
+        size += BLOCK_SIZE(next);
+        PUT(HDRP(bp), PACK(size, 0));
+        PUT(FTRP(bp), PACK(size, 0));
+    }
+
+    return bp;
+}
+/*
  * malloc
  */
 void *malloc (size_t size) {
@@ -271,14 +291,53 @@ void *malloc (size_t size) {
  * free
  */
 void free (void *ptr) {
-    if(!ptr) return;
+    if(ptr == NULL)
+        return;
+
+    size_t size = BLOCK_SIZE(ptr);
+    PUT(HDRP(ptr), PACK(size, 0));
+    PUT(FTRP(ptr), PACK(size, 0));
+    ptr = coalesce(ptr);
+    LEFT_CHILD(ptr) = 0;
+    RIGHT_CHILD(ptr) = 0;
+    free_blocks_tree = insert_freenode(free_blocks_tree, getoffset(ptr));
 }
 
 /*
  * realloc - you may want to look at mm-naive.c
  */
 void *realloc(void *oldptr, size_t size) {
-    return NULL;
+    size_t oldsize;
+    void *newptr;
+
+    /* If size == 0 then this is just free, and we return NULL. */
+    if(size == 0) {
+        free(oldptr);
+        return 0;
+    }
+
+    /* If oldptr is NULL, then this is just malloc. */
+    if(oldptr == NULL) {
+        return malloc(size);
+    }
+
+    newptr = malloc(size);
+
+    /* If realloc() fails the original block is left untouched  */
+    if(!newptr) {
+        return 0;
+    }
+
+    /* Copy the old data. */
+    oldsize = BLOCK_SIZE(oldptr) - DSIZE;
+    if(size < oldsize) 
+        oldsize = size;
+    memcpy(newptr, oldptr, oldsize);
+
+    /* Free the old block. */
+    free(oldptr);
+
+    return newptr;
 }
 
 /*
@@ -287,7 +346,13 @@ void *realloc(void *oldptr, size_t size) {
  * needed to run the traces.
  */
 void *calloc (size_t nmemb, size_t size) {
-    return NULL;
+    size_t bytes = nmemb * size;
+    void *newptr;
+
+    newptr = malloc(bytes);
+    memset(newptr, 0, bytes);
+
+    return newptr;
 }
 
 
