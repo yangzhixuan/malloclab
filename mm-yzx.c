@@ -42,7 +42,7 @@
 #define WSIZE 4
 #define DSIZE 8
 #define MINIMAL_BLOCKSIZE 16
-#define CHUNKSIZE (1<<12)
+#define CHUNKSIZE (0)
 #define PACK(size, alloc) ((size) | (alloc))
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
