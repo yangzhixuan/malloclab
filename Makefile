@@ -3,7 +3,7 @@
 #
 PG = -pg
 CC = gcc
-CFLAGS = -Wall -Wextra -g -DDRIVER -std=gnu99 $(PG) -Ofast -march=native
+CFLAGS = -Wall -Wextra -g -DDRIVER -std=gnu99 $(PG) -O2
 
 OBJS = mdriver.o mm.o memlib.o fsecs.o fcyc.o clock.o ftimer.o 
 

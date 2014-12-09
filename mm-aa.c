@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <setjmp.h>
 
 #include "mm.h"
 #include "memlib.h"
@@ -42,7 +43,7 @@
 #define WSIZE 4
 #define DSIZE 8
 #define MINIMAL_BLOCKSIZE 16
-#define CHUNKSIZE ((size_t) 0)
+#define CHUNKSIZE ((size_t) 256)
 #define PACK(size, color, alloc) ((size) | (alloc) | ((color) << 1))
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
@@ -71,10 +72,7 @@ inline static int LEFTER(void *b1, void *b2)
 
 inline static void setcolor(void *bp, int color)
 {
-    void *hp = HDRP(bp);
-    int size = GET_SIZE(hp);
-    int alloc = GET_ALLOC(hp);
-    PUT(hp, PACK(size, color, alloc));
+     *HDRP(bp) = *HDRP(bp) & (~2) | (color << 1);
 }
 
 /* forward declarations and type definitions */
@@ -157,6 +155,8 @@ static freenode_offset find_fit(freenode_offset root, size_t size)
             if(diff <= best_fit) {
                 best_fit = diff;
                 best_fit_node = root;
+                if(diff == 0)
+                    return best_fit_node;
             }
             root = LEFT_CHILD(bp);
         } else {
@@ -166,16 +166,6 @@ static freenode_offset find_fit(freenode_offset root, size_t size)
     return best_fit_node;
 }
 
-
-/*
- * Helper for swapping the color of two nodes
- */
-inline static void swap_color(void *b1, void* b2)
-{
-    int c1 = BLOCK_COLOR(b1);
-    setcolor(b1, BLOCK_COLOR(b2));
-    setcolor(b2, c1);
-}
 
 /*
  * Binary search tree rotation. Arguments l stands for the direction.
@@ -197,7 +187,9 @@ inline static void* skew(void* bp)
 {
     if(BLOCK_COLOR(getbp(LEFT_CHILD(bp))) == RED) {
         bp = rotate(bp, L);
-        swap_color(bp, getbp(RIGHT_CHILD(bp)));
+        void *rbp = getbp(RIGHT_CHILD(bp));
+        setcolor(bp, BLOCK_COLOR(rbp));
+        setcolor(rbp, RED);
     }
     return bp;
 }
@@ -211,7 +203,7 @@ inline static void* split(void* root)
     void *rrbp = getbp(RIGHT_CHILD(rbp));
     if(BLOCK_COLOR(rbp) == RED && BLOCK_COLOR(rrbp) == RED) {
         root = rotate(root, R);
-        setcolor(getbp(RIGHT_CHILD(root)), BLACK);
+        setcolor(rrbp, BLACK);
     }
     return root;
 }
@@ -219,11 +211,12 @@ inline static void* split(void* root)
 /*
  * Insert nodep into the AA tree and maintain the AA properties.
  */
+static int maintained;
 static void* insertAA(void* bp, void* nodep)
 {
     if(bp == nullnode) {
-        LEFT_CHILD(nodep) = 0;
-        RIGHT_CHILD(nodep) = 0;
+        // set two children point to nullnode
+        *(long*)nodep = 0;
         setcolor(nodep, RED);
         return nodep;
     }
@@ -232,6 +225,11 @@ static void* insertAA(void* bp, void* nodep)
     } else {
         RIGHT_CHILD(bp) = getoffset(insertAA(getbp(RIGHT_CHILD(bp)), nodep));
     }
+    // void* oldbp = bp, *bp1, *bp2;
+    // bp1 = bp = skew(bp);
+    // bp2 = bp = split(bp);
+    // if(oldbp == bp1 && bp1 == bp2)
+    //     maintained = 1;
     bp = skew(bp);
     bp = split(bp);
     return bp;
@@ -243,6 +241,7 @@ static void* insertAA(void* bp, void* nodep)
 static freenode_offset insert_freenode(freenode_offset root, freenode_offset node)
 {
     void *rootbp;
+    maintained = 0;
     rootbp = insertAA(getbp(root), getbp(node));
     setcolor(rootbp, BLACK);
     return getoffset(rootbp);
@@ -250,7 +249,6 @@ static freenode_offset insert_freenode(freenode_offset root, freenode_offset nod
 
 static void place(void *bp, size_t size)
 {
-    assert(BLOCK_SIZE(bp) >= size);
     size_t csize = BLOCK_SIZE(bp);
     if(csize - size >= MINIMAL_BLOCKSIZE) {
         PUT(HDRP(bp), PACK(size, 0, 1));
@@ -294,28 +292,17 @@ static void* coalesce(void *bp)
     return bp;
 }
 
-/*
- * Helper function for getting the left most node of the search tree
- */
-static void* get_leftmost_node( void *root )
-{
-    while(LEFT_CHILD(root) != 0) {
-        root = getbp(LEFT_CHILD(root));
-    }
-    return root;
-}
 
 /*
  * Decrease the level of root.
  * Child nodes may need repainted.
  */
-void decrease_level(void *rt, int decreaseL, int decreaseR)
+static inline void decrease_level(void *rt, int dir)
 {
     setcolor(rt, BLACK);
-    if(decreaseL) {
+    if(dir == L) {
         setcolor(getbp(LEFT_CHILD(rt)), RED);
-    }
-    if(decreaseR) {
+    } else {
         void *rc = getbp(RIGHT_CHILD(rt));
         if(BLOCK_COLOR(rc) == RED) {
             setcolor(getbp(LEFT_CHILD(rc)), RED);
@@ -337,7 +324,6 @@ static void* remove_aa_leaf(void *root, void *node, int *level_diff)
     }
     if(node == root) {
         // Got the node, it should be a leaf.
-        assert(LEFT_CHILD(node) == 0 && RIGHT_CHILD(node) == 0);
         *level_diff = -1;
         return nullnode;
     } else {
@@ -352,10 +338,7 @@ static void* remove_aa_leaf(void *root, void *node, int *level_diff)
                 setcolor(getbp(CHILD(root, dir)), BLACK);
                 *level_diff = 0;
             } else {
-                if(dir == L)
-                    decrease_level(root, 0, 1);
-                else
-                    decrease_level(root, 1, 0);
+                decrease_level(root, L^R^dir);
                 root = skew(root);
 
                 void *rc = getbp(RIGHT_CHILD(root));
@@ -381,19 +364,40 @@ static void* remove_aa_leaf(void *root, void *node, int *level_diff)
  */
 static void* replace(void *root, void *old, void *neew)
 {
-    if(root == nullnode) {
-        fprintf(stderr, "Replace: can't find the old node\n");
-        return nullnode;
+    void *oldroot = root;
+    freenode_offset *prt_Pointer = NULL;
+    while(root != nullnode) {
+        if(root == old) {
+            LEFT_CHILD(neew) = LEFT_CHILD(old);
+            RIGHT_CHILD(neew) = RIGHT_CHILD(old);
+            setcolor(neew, BLOCK_COLOR(old));
+            if(prt_Pointer == NULL) {
+                oldroot = neew;
+            } else {
+                *prt_Pointer = getoffset(neew);
+            }
+            return oldroot;
+        } else if(LEFTER(old, root)) {
+            prt_Pointer = & LEFT_CHILD(root);
+            root = getbp(LEFT_CHILD(root));
+        } else {
+            prt_Pointer = & RIGHT_CHILD(root);
+            root = getbp(RIGHT_CHILD(root));
+        }
     }
-    if(root == old) {
-        LEFT_CHILD(neew) = LEFT_CHILD(old);
-        RIGHT_CHILD(neew) = RIGHT_CHILD(old);
-        setcolor(neew, BLOCK_COLOR(old));
-        root = neew;
-    } else if(LEFTER(old, root)) {
-        LEFT_CHILD(root) = getoffset(replace(getbp(LEFT_CHILD(root)), old, neew));
-    } else {
-        RIGHT_CHILD(root) = getoffset(replace(getbp(RIGHT_CHILD(root)), old, neew));
+
+    fprintf(stderr, "Replace: can't find the old node\n");
+    return root;
+}
+
+/*
+ * Helper function for getting the left most node of the search tree
+ */
+static void* get_leftmost_node( void *root, freenode_offset **prtPointer)
+{
+    while(LEFT_CHILD(root) != 0) {
+        *prtPointer = &LEFT_CHILD(root);
+        root = getbp(LEFT_CHILD(root));
     }
     return root;
 }
@@ -405,14 +409,24 @@ static freenode_offset remove_freenode(freenode_offset root, freenode_offset nod
 {
     void *rootbp = getbp(root);
     void *nodebp = getbp(node);
+    int tmp;
     if(LEFT_CHILD(nodebp) == 0 && RIGHT_CHILD(nodebp) == 0) {
-        int tmp;
         rootbp = remove_aa_leaf(rootbp, nodebp, &tmp);
         setcolor(rootbp, BLACK);
     } else {
-        void *succ = get_leftmost_node(getbp(RIGHT_CHILD(nodebp)));
-        root = remove_freenode(root, getoffset(succ));
-        rootbp = getbp(root);
+        freenode_offset *succ_parent = &RIGHT_CHILD(nodebp);
+        void *succ = get_leftmost_node(getbp(RIGHT_CHILD(nodebp)), &succ_parent);
+        if(RIGHT_CHILD(succ) == 0) {
+            if(BLOCK_COLOR(succ) == RED) {
+                *succ_parent = 0;
+            } else {
+                rootbp = remove_aa_leaf(rootbp, succ, &tmp);
+                setcolor(rootbp, BLACK);
+            }
+        } else {
+            *succ_parent = RIGHT_CHILD(succ);
+            setcolor(getbp(RIGHT_CHILD(succ)), BLACK);
+        }
         rootbp = replace(rootbp, nodebp, succ);
     }
     return getoffset(rootbp);
