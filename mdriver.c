@@ -1313,7 +1313,7 @@ static void printresults(int n, stats_t *stats)
         if(sum_perf_weight == 0) sum_perf_weight = 1;
         if(sum_util_weight == 0) sum_util_weight = 1;
 
-        printf("%2d %2d  %5.0f%%%8.0f%10.6f%6.0f\n",
+        printf("%2d %2d  %5.3f%%%8.0f%10.6f%6.0f\n",
                sum_util_weight,
                sum_perf_weight,
                (sumutil/(double)sum_util_weight)*100.0,

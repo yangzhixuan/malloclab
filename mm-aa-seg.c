@@ -45,21 +45,23 @@
 #define MINIMAL_BLOCKSIZE 16
 #define CACHED_SIZE 64
 #define CACHED_CLASSES (CACHED_SIZE / DSIZE)
-#define CHUNKSIZE ((size_t) 80)
+#define CHUNKSIZE ((size_t) 96)
 #define PACK(size, color, alloc) ((size) | (alloc) | ((color) << 1))
+#define PACK3(size, used, color, alloc) ((size) | (alloc) | ((color) << 1) | ((used) << 2))
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
 #define GET_SIZE(p) (GET(p) & ~7)
 #define GET_ALLOC(p) (GET(p) & 1)
 #define GET_COLOR(p) ((GET(p) >> 1) & 1)
+#define GET_PREVUSED(p) ((GET(p) >> 2) & 1)
 #define HDRP(bp) ((char*)(bp) - WSIZE)
 #define FTRP(bp) ((char*)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
 #define BLOCK_SIZE(bp) (GET_SIZE(HDRP(bp)))
 #define BLOCK_COLOR(bp) (GET_COLOR(HDRP(bp)))
 #define LEFT_CHILD(bp) (GET(bp))
 #define RIGHT_CHILD(bp) (GET((char*)(bp) + WSIZE))
-#define PREV_FREE(bp) (GET(bp))
-#define NEXT_FREE(bp) (GET((char*)(bp) + WSIZE))
+#define NEXT_FREE(bp) (GET(bp))
+#define PREV_FREE(bp) (GET((char*)(bp) + WSIZE))
 #define CHILD(bp, ind) (GET((char*)(bp) + (ind) * WSIZE))
 #define NEXT_BLKP(bp) ((char*)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char*)(bp) - GET_SIZE(HDRP(bp) - WSIZE))
@@ -71,12 +73,17 @@
 inline static int LEFTER(void *b1, void *b2)
 {
     return (BLOCK_SIZE(b1) < BLOCK_SIZE(b2))
-        || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && b1 < b2);
+        || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && (b1) < (b2));
 }
 
 inline static void setcolor(void *bp, int color)
 {
      *HDRP(bp) = ((*HDRP(bp)) & (~2)) | (color << 1);
+}
+
+inline static void setprevused(void *bp, int used)
+{
+     *HDRP(bp) = ((*HDRP(bp)) & (~4)) | (used << 2);
 }
 
 /* forward declarations and type definitions */
@@ -89,8 +96,10 @@ static void remove_freenode(void* node);
 static void* heap_listp;
 static void* nullnode;
 static void* lists_header;
+static void* epilogue;
 /* root node of the free block binary search tree */
 static void* free_blocks_tree;
+static int current_chunksize;
 
 static inline void* getbp(freenode_offset off)
 {
@@ -103,40 +112,36 @@ static inline freenode_offset getoffset(void* bp)
 
 static inline void* getheader(int size)
 {
-    assert(size >= MINIMAL_BLOCKSIZE && size <= CACHED_SIZE);
     size = size / DSIZE * DSIZE;
-    return lists_header + (size - MINIMAL_BLOCKSIZE) * 2;
+    return lists_header + (size - MINIMAL_BLOCKSIZE) / 2;
 }
 
 /*
  * Initialize: return -1 on error, 0 on success.
  */
 int mm_init(void) {
-    if((heap_listp = mem_sbrk( (1 + 1 + CACHED_CLASSES) * 4 * WSIZE)) == (void *) -1)
+    if((heap_listp = mem_sbrk( (2 + 4 + CACHED_CLASSES + 2) * WSIZE)) == (void *) -1)
         return -1;
     PUT(heap_listp, 0);     /* for alignment */
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 0, 1));
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 0, 1));
 
     /* the red-black tree nullnode */
-    free_blocks_tree = nullnode = heap_listp + 4 * WSIZE;
-    PUT(heap_listp + (3*WSIZE), PACK(2*DSIZE, BLACK, 1));
-    PUT(heap_listp + (4*WSIZE), 0);
-    PUT(heap_listp + (5*WSIZE), 0);
-    PUT(heap_listp + (6*WSIZE), PACK(2*DSIZE, BLACK, 1));
+    free_blocks_tree = nullnode = heap_listp + 2 * WSIZE;
+    PUT(heap_listp + (1*WSIZE), PACK3(2*DSIZE, 1, BLACK, 1));
+    PUT(heap_listp + (2*WSIZE), 0);
+    PUT(heap_listp + (3*WSIZE), 0);
+    PUT(heap_listp + (4*WSIZE), PACK(2*DSIZE, BLACK, 1));
 
     /* headers for the cached lists */
     int i;
+    PUT(heap_listp + 5*WSIZE, PACK3(2*DSIZE, 1, 0, 1));
     for(i = 0; i < CACHED_CLASSES; i++) {
-        PUT(heap_listp + (7+i*4+0)*WSIZE, PACK(2*DSIZE, 0, 1));
-        PUT(heap_listp + (7+i*4+1)*WSIZE, 0);
-        PUT(heap_listp + (7+i*4+2)*WSIZE, 0);
-        PUT(heap_listp + (7+i*4+3)*WSIZE, PACK(2*DSIZE, 0, 1));
+        PUT(heap_listp + (5+i+1)*WSIZE, 0);
     }
-    lists_header = heap_listp + 7*WSIZE;
+    PUT(heap_listp + (5+CACHED_CLASSES+1)*WSIZE, PACK(2*DSIZE, 0, 1));
+    lists_header = heap_listp + 6*WSIZE;
 
-    PUT(heap_listp + ((7+CACHED_CLASSES*4)*WSIZE), PACK(0, 0, 1));
-    heap_listp += 2 * WSIZE;
+    epilogue = heap_listp + ((5+CACHED_CLASSES+1+1+1)*WSIZE);
+    PUT(heap_listp + ((5+CACHED_CLASSES+1+1)*WSIZE), PACK3(0, 1, 0, 1));
 
     return 0;
 }
@@ -153,9 +158,11 @@ static void *extend_heap(size_t words)
     if((long)(bp = mem_sbrk(size)) == -1)
         return NULL;
 
-    PUT(HDRP(bp), PACK(size, 0, 0));
+    int prev_used = GET_PREVUSED(HDRP(bp));
+    PUT(HDRP(bp), PACK3(size, prev_used, 0, 0));
     PUT(FTRP(bp), PACK(size, 0, 0));
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 0, 1));
+    epilogue = NEXT_BLKP(bp);
+    PUT(HDRP(epilogue), PACK(0, 0, 1));
 
     return coalesce(bp);
 }
@@ -172,7 +179,7 @@ static void* find_fit(size_t size)
         if(NEXT_FREE(header) != 0) {
             return getbp(NEXT_FREE(header));
         }
-        return find_fit(size + (size == CACHED_SIZE ? 1 : DSIZE));
+        return find_fit(size + DSIZE);
     } else {
         size_t best_fit = (size_t) 0 - 1;
         void *best_fit_node = NULL;
@@ -184,8 +191,6 @@ static void* find_fit(size_t size)
                 if(diff <= best_fit) {
                     best_fit = diff;
                     best_fit_node = bp;
-                    if(diff == 0)
-                        break;
                 }
                 bp = getbp(LEFT_CHILD(bp));
             } else {
@@ -275,7 +280,6 @@ static void insert_freenode(void *node)
         NEXT_FREE(header) = getoffset(node);
         PREV_FREE(node) = getoffset(header);
     } else {
-        void *rootbp;
         free_blocks_tree = insertAA(free_blocks_tree, node);
         setcolor(free_blocks_tree, BLACK);
     }
@@ -284,18 +288,18 @@ static void insert_freenode(void *node)
 static void place(void *bp, size_t size)
 {
     size_t csize = BLOCK_SIZE(bp);
+    int prev_used = GET_PREVUSED(HDRP(bp));
     if(csize - size >= MINIMAL_BLOCKSIZE) {
-        PUT(HDRP(bp), PACK(size, 0, 1));
-        PUT(FTRP(bp), PACK(size, 0, 1));
+        PUT(HDRP(bp), PACK3(size, prev_used, 0, 1));
         bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK(csize - size, 0, 0));
+        PUT(HDRP(bp), PACK3(csize - size, 1, 0, 0));
         PUT(FTRP(bp), PACK(csize - size, 0, 0));
         LEFT_CHILD(bp) = 0;
         RIGHT_CHILD(bp) = 0;
         insert_freenode(bp);
     } else {
-        PUT(HDRP(bp), PACK(csize, 0, 1));
-        PUT(FTRP(bp), PACK(csize, 0, 1));
+        PUT(HDRP(bp), PACK3(csize, prev_used, 0, 1));
+        setprevused(NEXT_BLKP(bp), 1);
     }
 }
 
@@ -307,11 +311,12 @@ static void* coalesce(void *bp)
     void *prev;
     void *next;
     size_t size = BLOCK_SIZE(bp);
-    prev = PREV_BLKP(bp);
-    if(GET_ALLOC(HDRP(prev)) == 0) {
+    if(GET_PREVUSED(HDRP(bp)) == 0) {
+        prev = PREV_BLKP(bp);
         remove_freenode(prev);
         size += BLOCK_SIZE(prev);
-        PUT(HDRP(prev), PACK(size, 0, 0));
+        int prev_used = GET_PREVUSED(HDRP(prev));
+        PUT(HDRP(prev), PACK3(size, prev_used, 0, 0));
         PUT(FTRP(prev), PACK(size, 0, 0));
         bp = prev;
     }
@@ -319,13 +324,12 @@ static void* coalesce(void *bp)
     if(GET_ALLOC(HDRP(next)) == 0) {
         remove_freenode(next);
         size += BLOCK_SIZE(next);
-        PUT(HDRP(bp), PACK(size, 0, 0));
+        int prev_used = GET_PREVUSED(HDRP(bp));
+        PUT(HDRP(bp), PACK3(size, prev_used, 0, 0));
         PUT(FTRP(bp), PACK(size, 0, 0));
     }
-
     return bp;
 }
-
 
 /*
  * Decrease the level of root.
@@ -441,7 +445,6 @@ static void* get_leftmost_node( void *root, freenode_offset **prtPointer)
  */
 static void remove_freenode(void* nodebp)
 {
-    assert(GET_ALLOC(nodebp) == 0);
     if(BLOCK_SIZE(nodebp) <= CACHED_SIZE) {
         void *prev = getbp(PREV_FREE(nodebp));
         void *next = getbp(NEXT_FREE(nodebp));   /* maybe nullnode */
@@ -484,16 +487,18 @@ void *malloc (size_t size) {
     if(size == 0)
         return NULL;
 
-    if(size <= DSIZE)
+    asize = (size + WSIZE + DSIZE - 1) / DSIZE * DSIZE;
+    if(asize < MINIMAL_BLOCKSIZE)
         asize = MINIMAL_BLOCKSIZE;
-    else
-        asize = (size + DSIZE + DSIZE - 1) / DSIZE * DSIZE;
 
     bp = find_fit(asize);
 
     if(bp == NULL) {
         /* can't find a fit, allocate more memory and place the block */
         extendsize = asize;
+        if(GET_PREVUSED(HDRP(epilogue)) == 0) {
+              extendsize -= BLOCK_SIZE(PREV_BLKP(epilogue));
+        }
         if(extendsize <= CHUNKSIZE) {
             extendsize = CHUNKSIZE;
         }
@@ -515,8 +520,11 @@ void free(void *ptr) {
         return;
 
     size_t size = BLOCK_SIZE(ptr);
-    PUT(HDRP(ptr), PACK(size, 0, 0));
+    int prev_used = GET_PREVUSED(HDRP(ptr));
+    PUT(HDRP(ptr), PACK3(size, prev_used,  0, 0));
     PUT(FTRP(ptr), PACK(size, 0, 0));
+    setprevused(NEXT_BLKP(ptr), 0);
+
     ptr = coalesce(ptr);
     LEFT_CHILD(ptr) = 0;
     RIGHT_CHILD(ptr) = 0;
@@ -549,7 +557,7 @@ void *realloc(void *oldptr, size_t size) {
     }
 
     /* Copy the old data. */
-    oldsize = BLOCK_SIZE(oldptr) - DSIZE;
+    oldsize = BLOCK_SIZE(oldptr) - WSIZE;
     if(size < oldsize) 
         oldsize = size;
     memcpy(newptr, oldptr, oldsize);
