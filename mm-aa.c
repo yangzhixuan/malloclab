@@ -42,7 +42,7 @@
 #define WSIZE 4
 #define DSIZE 8
 #define MINIMAL_BLOCKSIZE 16
-#define CHUNKSIZE ((size_t)0)
+#define CHUNKSIZE ((size_t) 0)
 #define PACK(size, color, alloc) ((size) | (alloc) | ((color) << 1))
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
@@ -55,18 +55,20 @@
 #define BLOCK_COLOR(bp) (GET_COLOR(HDRP(bp)))
 #define LEFT_CHILD(bp) (GET(bp))
 #define RIGHT_CHILD(bp) (GET((char*)(bp) + WSIZE))
-#define CHILD(bp, ind) (GET((char*)(bp) + ind * WSIZE))
+#define CHILD(bp, ind) (GET((char*)(bp) + (ind) * WSIZE))
 #define NEXT_BLKP(bp) ((char*)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char*)(bp) - GET_SIZE(HDRP(bp) - WSIZE))
 #define L (0)
 #define R (1)
 #define BLACK (0)
 #define RED (1)
-int LEFTER(void *b1, void *b2)
+
+inline static int LEFTER(void *b1, void *b2)
 {
-    return (BLOCK_SIZE(b1) < BLOCK_SIZE(b2)) 
-        || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && (b1) < (b2));
+    return (BLOCK_SIZE(b1) < BLOCK_SIZE(b2))
+        || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && b1 < b2);
 }
+
 inline static void setcolor(void *bp, int color)
 {
     void *hp = HDRP(bp);
@@ -168,7 +170,7 @@ static freenode_offset find_fit(freenode_offset root, size_t size)
 /*
  * Helper for swapping the color of two nodes
  */
-void swap_color(void *b1, void* b2)
+inline static void swap_color(void *b1, void* b2)
 {
     int c1 = BLOCK_COLOR(b1);
     setcolor(b1, BLOCK_COLOR(b2));
@@ -179,11 +181,11 @@ void swap_color(void *b1, void* b2)
  * Binary search tree rotation. Arguments l stands for the direction.
  * When l is L, rotate the left son.
  */
-static void* rotate(void* rt, int l)
+inline static void* rotate(void* rt, int l)
 {
     int r = L ^ R ^ l;
     void *newrt = getbp(CHILD(rt, l));
-    CHILD(rt, r) = CHILD(newrt, r);
+    CHILD(rt, l) = CHILD(newrt, r);
     CHILD(newrt, r) = getoffset(rt);
     return newrt;
 }
@@ -191,7 +193,7 @@ static void* rotate(void* rt, int l)
 /*
  * Skew
  */
-static void* skew(void* bp)
+inline static void* skew(void* bp)
 {
     if(BLOCK_COLOR(getbp(LEFT_CHILD(bp))) == RED) {
         bp = rotate(bp, L);
@@ -203,7 +205,7 @@ static void* skew(void* bp)
 /*
  * Split
  */
-static void* split(void* root)
+inline static void* split(void* root)
 {
     void *rbp = getbp(RIGHT_CHILD(root));
     void *rrbp = getbp(RIGHT_CHILD(rbp));
@@ -438,7 +440,7 @@ void *malloc (size_t size) {
     if(offset == 0) {
         /* can't find a fit, allocate more memory and place the block */
         extendsize = asize;
-        if(extendsize < CHUNKSIZE) {
+        if(extendsize <= CHUNKSIZE) {
             extendsize = CHUNKSIZE;
         }
         bp = extend_heap(extendsize / WSIZE);
