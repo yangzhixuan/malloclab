@@ -42,7 +42,7 @@
 #define WSIZE 4
 #define DSIZE 8
 #define MINIMAL_BLOCKSIZE 16
-#define CHUNKSIZE (0)
+#define CHUNKSIZE ((size_t)0)
 #define PACK(size, color, alloc) ((size) | (alloc) | ((color) << 1))
 #define GET(p) (*(unsigned int *)(p))
 #define PUT(p, val) (*(unsigned int *)(p) = (val))
@@ -70,16 +70,15 @@ int LEFTER(void *b1, void *b2)
 inline static void setcolor(void *bp, int color)
 {
     void *hp = HDRP(bp);
-    void *fp = FTRP(bp);
     int size = GET_SIZE(hp);
     int alloc = GET_ALLOC(hp);
     PUT(hp, PACK(size, color, alloc));
-    PUT(fp, PACK(size, color, alloc));
 }
 
 /* forward declarations and type definitions */
 static void *coalesce(void *bp);
 typedef unsigned int freenode_offset;
+static freenode_offset remove_freenode(freenode_offset root, freenode_offset node);
 
 
 /* pointer to the first (by address order) block (the prologue block) of the heap */
@@ -165,58 +164,10 @@ static freenode_offset find_fit(freenode_offset root, size_t size)
     return best_fit_node;
 }
 
-/*
- * Helper function for getting the left most node of the search tree
- */
-static freenode_offset get_leftmost_node( freenode_offset root )
-{
-    assert( root != 0 );
-
-    freenode_offset child = LEFT_CHILD( getbp(root) );
-    while(child != 0) {
-        root = child;
-        child = LEFT_CHILD( getbp(root) );
-    }
-    return root;
-}
 
 /*
- * Remove a free node from the tree.
+ * Helper for swapping the color of two nodes
  */
-static freenode_offset remove_freenode(freenode_offset root, freenode_offset node)
-{
-    if(root == 0) {
-        dbg_printf("should not remove nonexistent node\n");
-        return 0;
-    }
-    void *bp = getbp(root);
-    void *nodep = getbp(node);
-    if(root != node) {
-        if(BLOCK_SIZE(nodep) < BLOCK_SIZE(bp)) {
-            LEFT_CHILD(bp) = remove_freenode(LEFT_CHILD(bp), node);
-        } else {
-            RIGHT_CHILD(bp) = remove_freenode(RIGHT_CHILD(bp), node);
-        } 
-        return root;
-    } else {
-        if( RIGHT_CHILD(bp) == 0 ) {
-            return LEFT_CHILD(bp);
-        } else if( LEFT_CHILD(bp) == 0 ) {
-            return RIGHT_CHILD(bp);
-        }else {
-            /* if the node has both children, we have to find the leftmost node
-             * in the right subtree to replace this node in the tree */
-            freenode_offset newrt;
-            newrt = get_leftmost_node( RIGHT_CHILD(bp) );
-            RIGHT_CHILD(bp) = remove_freenode( RIGHT_CHILD(bp), newrt);
-            void *newrt_bp = getbp(newrt);
-            LEFT_CHILD(newrt_bp) = LEFT_CHILD(bp);
-            RIGHT_CHILD(newrt_bp) = RIGHT_CHILD(bp);
-            return newrt;
-        }
-    }
-}
-
 void swap_color(void *b1, void* b2)
 {
     int c1 = BLOCK_COLOR(b1);
@@ -224,6 +175,10 @@ void swap_color(void *b1, void* b2)
     setcolor(b2, c1);
 }
 
+/*
+ * Binary search tree rotation. Arguments l stands for the direction.
+ * When l is L, rotate the left son.
+ */
 static void* rotate(void* rt, int l)
 {
     int r = L ^ R ^ l;
@@ -233,6 +188,9 @@ static void* rotate(void* rt, int l)
     return newrt;
 }
 
+/*
+ * Skew
+ */
 static void* skew(void* bp)
 {
     if(BLOCK_COLOR(getbp(LEFT_CHILD(bp))) == RED) {
@@ -242,6 +200,9 @@ static void* skew(void* bp)
     return bp;
 }
 
+/*
+ * Split
+ */
 static void* split(void* root)
 {
     void *rbp = getbp(RIGHT_CHILD(root));
@@ -253,6 +214,9 @@ static void* split(void* root)
     return root;
 }
 
+/*
+ * Insert nodep into the AA tree and maintain the AA properties.
+ */
 static void* insertAA(void* bp, void* nodep)
 {
     if(bp == nullnode) {
@@ -271,6 +235,9 @@ static void* insertAA(void* bp, void* nodep)
     return bp;
 }
 
+/*
+ * Wrapper for insertAA() and make sure the root is BLACK.
+ */
 static freenode_offset insert_freenode(freenode_offset root, freenode_offset node)
 {
     void *rootbp;
@@ -324,6 +291,131 @@ static void* coalesce(void *bp)
 
     return bp;
 }
+
+/*
+ * Helper function for getting the left most node of the search tree
+ */
+static void* get_leftmost_node( void *root )
+{
+    while(LEFT_CHILD(root) != 0) {
+        root = getbp(LEFT_CHILD(root));
+    }
+    return root;
+}
+
+/*
+ * Decrease the level of root.
+ * Child nodes may need repainted.
+ */
+void decrease_level(void *rt, int decreaseL, int decreaseR)
+{
+    setcolor(rt, BLACK);
+    if(decreaseL) {
+        setcolor(getbp(LEFT_CHILD(rt)), RED);
+    }
+    if(decreaseR) {
+        void *rc = getbp(RIGHT_CHILD(rt));
+        if(BLOCK_COLOR(rc) == RED) {
+            setcolor(getbp(LEFT_CHILD(rc)), RED);
+            setcolor(getbp(RIGHT_CHILD(rc)), RED);
+        }
+        setcolor(rc, RED);
+    }
+}
+
+/*
+ * Removing a leaf node from the AA tree. 
+ * The BLACK leaf case if nontrivial.
+ */
+static void* remove_aa_leaf(void *root, void *node, int *level_diff)
+{
+    if(root == nullnode) {
+        fprintf(stderr, "remove_aa_leaf: can't find the node\n");
+        return nullnode;
+    }
+    if(node == root) {
+        // Got the node, it should be a leaf.
+        assert(LEFT_CHILD(node) == 0 && RIGHT_CHILD(node) == 0);
+        *level_diff = -1;
+        return nullnode;
+    } else {
+        int dir;
+        dir = LEFTER(node, root) ? L : R;
+        int old_color = BLOCK_COLOR(getbp(CHILD(root, dir)));
+        CHILD(root, dir) = getoffset(remove_aa_leaf(getbp(CHILD(root, dir)), node, level_diff));
+        if(*level_diff == 0) {
+            setcolor(getbp(CHILD(root, dir)), old_color);
+        } else {
+            if(old_color == RED) {
+                setcolor(getbp(CHILD(root, dir)), BLACK);
+                *level_diff = 0;
+            } else {
+                if(dir == L)
+                    decrease_level(root, 0, 1);
+                else
+                    decrease_level(root, 1, 0);
+                root = skew(root);
+
+                void *rc = getbp(RIGHT_CHILD(root));
+                RIGHT_CHILD(root) = getoffset(skew(rc));
+
+                rc = getbp(RIGHT_CHILD(root));
+                void *rrc = getbp(RIGHT_CHILD(rc));
+                RIGHT_CHILD(rc) = getoffset(skew(rrc));
+
+                void *newrt = split(root);
+                if(newrt != root)
+                    *level_diff = 0;
+                root = newrt;
+                RIGHT_CHILD(root) = getoffset(split(getbp(RIGHT_CHILD(root))));
+            }
+        }
+        return root;
+    }
+}
+
+/*
+ * Replace the old node in the tree with the new one.
+ */
+static void* replace(void *root, void *old, void *neew)
+{
+    if(root == nullnode) {
+        fprintf(stderr, "Replace: can't find the old node\n");
+        return nullnode;
+    }
+    if(root == old) {
+        LEFT_CHILD(neew) = LEFT_CHILD(old);
+        RIGHT_CHILD(neew) = RIGHT_CHILD(old);
+        setcolor(neew, BLOCK_COLOR(old));
+        root = neew;
+    } else if(LEFTER(old, root)) {
+        LEFT_CHILD(root) = getoffset(replace(getbp(LEFT_CHILD(root)), old, neew));
+    } else {
+        RIGHT_CHILD(root) = getoffset(replace(getbp(RIGHT_CHILD(root)), old, neew));
+    }
+    return root;
+}
+
+/*
+ * Remove a free node from the tree.
+ */
+static freenode_offset remove_freenode(freenode_offset root, freenode_offset node)
+{
+    void *rootbp = getbp(root);
+    void *nodebp = getbp(node);
+    if(LEFT_CHILD(nodebp) == 0 && RIGHT_CHILD(nodebp) == 0) {
+        int tmp;
+        rootbp = remove_aa_leaf(rootbp, nodebp, &tmp);
+        setcolor(rootbp, BLACK);
+    } else {
+        void *succ = get_leftmost_node(getbp(RIGHT_CHILD(nodebp)));
+        root = remove_freenode(root, getoffset(succ));
+        rootbp = getbp(root);
+        rootbp = replace(rootbp, nodebp, succ);
+    }
+    return getoffset(rootbp);
+}
+
 /*
  * malloc
  */
