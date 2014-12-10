@@ -1,8 +1,18 @@
 /*
  * mm.c
+ * Yang Zhixuan 1300012785@pku.edu.cn
  *
- * NOTE TO STUDENTS: Replace this header comment with your own header
- * comment that gives a high level description of your solution.
+ * A (fast) best-fit malloc/free implementation.
+ *
+ * Small size free blocks(size smaller than CACHED_SIZE), which are frequently
+ * referenced, are organized as doubly linked lists(a list corresponds to a block
+ * size). Other blocks are maintained as an AA-tree (a variant of red-black tree)
+ * indexed by their block size.
+ *
+ * For every malloc request, we allocate the best fit block. If there are no
+ * free block available, call sbrk() for more heap space.
+ *
+ * Two adjacent free blocks are coalesced immediately whenever possible.
  */
 #include <assert.h>
 #include <stdio.h>
@@ -44,7 +54,7 @@
 #define DSIZE 8
 #define MINIMAL_BLOCKSIZE 16
 #define CACHED_SIZE 64
-#define CACHED_CLASSES (CACHED_SIZE / DSIZE)
+#define CACHED_CLASSES ((CACHED_SIZE - MINIMAL_BLOCKSIZE) / DSIZE + 1)
 #define CHUNKSIZE ((size_t) 96)
 #define PACK(size, color, alloc) ((size) | (alloc) | ((color) << 1))
 #define PACK3(size, used, color, alloc) ((size) | (alloc) | ((color) << 1) | ((used) << 2))
@@ -70,7 +80,12 @@
 #define BLACK (0)
 #define RED (1)
 
-inline static int LEFTER(void *b1, void *b2)
+/*
+ * Determine the order of blocks in the tree.
+ * Compare the address if the blocks have the same size so that different blocks
+ * have different keys.
+ */
+inline static int lefter(void *b1, void *b2)
 {
     return (BLOCK_SIZE(b1) < BLOCK_SIZE(b2))
         || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && (b1) < (b2));
@@ -88,60 +103,69 @@ inline static void setprevused(void *bp, int used)
 
 /* forward declarations and type definitions */
 static void *coalesce(void *bp);
-typedef unsigned int freenode_offset;
-static void remove_freenode(void* node);
+typedef unsigned int offset;
+static void remove_freeblock(void* node);
 
 
 /* pointer to the first (by address order) block (the prologue block) of the heap */
-static void* heap_listp;
+static void* heap_start;
 static void* nullnode;
 static void* lists_header;
 static void* epilogue;
 /* root node of the free block binary search tree */
 static void* free_blocks_tree;
-static int current_chunksize;
 
-static inline void* getbp(freenode_offset off)
+/*
+ * Block pointers are stored as 32-bit offset to save space.
+ */
+static inline void* getbp(offset off)
 {
     return nullnode + off;
 }
-static inline freenode_offset getoffset(void* bp)
+
+static inline offset getoffset(void* bp)
 {
-    return (freenode_offset) (bp - nullnode);
+    return (offset) (bp - nullnode);
 }
 
+/*
+ * Get the header of the list corresponding to the size.
+ */
 static inline void* getheader(int size)
 {
-    size = size / DSIZE * DSIZE;
-    return lists_header + (size - MINIMAL_BLOCKSIZE) / 2;
+    return lists_header + (size - MINIMAL_BLOCKSIZE) / (DSIZE / WSIZE);
 }
 
 /*
  * Initialize: return -1 on error, 0 on success.
  */
 int mm_init(void) {
-    if((heap_listp = mem_sbrk( (2 + 4 + CACHED_CLASSES + 2) * WSIZE)) == (void *) -1)
+    int i, a_classes = CACHED_CLASSES;
+
+    /* make sure CACHED_CLASSES is odd to satisfy the align requirement */
+    if(a_classes % 2 == 0)
+        a_classes += 1;
+
+    if((heap_start = mem_sbrk( (a_classes + 4 + 1) * WSIZE)) == (void *) -1) {
         return -1;
-    PUT(heap_listp, 0);     /* for alignment */
+    }
+
 
     /* the red-black tree nullnode */
-    free_blocks_tree = nullnode = heap_listp + 2 * WSIZE;
-    PUT(heap_listp + (1*WSIZE), PACK3(2*DSIZE, 1, BLACK, 1));
-    PUT(heap_listp + (2*WSIZE), 0);
-    PUT(heap_listp + (3*WSIZE), 0);
-    PUT(heap_listp + (4*WSIZE), PACK(2*DSIZE, BLACK, 1));
+    free_blocks_tree = nullnode = heap_start + WSIZE;
+    PUT(HDRP(nullnode),  PACK3(4 * WSIZE, 1, BLACK, 1));
+    LEFT_CHILD(nullnode) = 0;
+    RIGHT_CHILD(nullnode) = 0;
+    PUT(FTRP(nullnode), PACK(4 * WSIZE, BLACK, 1));
 
-    /* headers for the cached lists */
-    int i;
-    PUT(heap_listp + 5*WSIZE, PACK3(2*DSIZE, 1, 0, 1));
-    for(i = 0; i < CACHED_CLASSES; i++) {
-        PUT(heap_listp + (5+i+1)*WSIZE, 0);
+    /* cached lists headers */
+    lists_header = heap_start + 4 * WSIZE;
+    for(i = 0; i < a_classes; i++) {
+        PUT(lists_header + i * WSIZE, 0);
     }
-    PUT(heap_listp + (5+CACHED_CLASSES+1)*WSIZE, PACK(2*DSIZE, 0, 1));
-    lists_header = heap_listp + 6*WSIZE;
 
-    epilogue = heap_listp + ((5+CACHED_CLASSES+1+1+1)*WSIZE);
-    PUT(heap_listp + ((5+CACHED_CLASSES+1+1)*WSIZE), PACK3(0, 1, 0, 1));
+    epilogue = heap_start + (4 + a_classes + 1) * WSIZE;
+    PUT(HDRP(epilogue), PACK3(0, 1, 0, 1));
 
     return 0;
 }
@@ -169,7 +193,7 @@ static void *extend_heap(size_t words)
 
 
 /*
- *
+ * find_fit: find the best fit free block.
  */
 static void* find_fit(size_t size)
 {
@@ -202,6 +226,9 @@ static void* find_fit(size_t size)
 }
 
 
+
+/***************************** AA tree functions ******************************/
+/******************************************************************************/
 /*
  * Binary search tree rotation. Arguments l stands for the direction.
  * When l is L, rotate the left son.
@@ -216,7 +243,10 @@ inline static void* rotate(void* rt, int l)
 }
 
 /*
- * Skew
+ * Skew: AA-tree maintaince operation. 
+ * See [http://user.it.uu.se/~arnea/ps/simp.pdf] for detail.
+ * Notice that only 1-bit color information is stored here so that maintenance
+ * routines are some what more complex than their ordinary forms.
  */
 inline static void* skew(void* bp)
 {
@@ -230,7 +260,7 @@ inline static void* skew(void* bp)
 }
 
 /*
- * Split
+ * Split: AA-tree maintaince operation
  */
 inline static void* split(void* root)
 {
@@ -244,96 +274,7 @@ inline static void* split(void* root)
 }
 
 /*
- * Insert nodep into the AA tree and maintain the AA properties.
- */
-static void* insertAA(void* bp, void* nodep)
-{
-    if(bp == nullnode) {
-        // set two children point to nullnode
-        *(long*)nodep = 0;
-        setcolor(nodep, RED);
-        return nodep;
-    }
-    if(LEFTER(nodep, bp)) {
-        LEFT_CHILD(bp) = getoffset(insertAA(getbp(LEFT_CHILD(bp)), nodep));
-    } else {
-        RIGHT_CHILD(bp) = getoffset(insertAA(getbp(RIGHT_CHILD(bp)), nodep));
-    }
-    bp = skew(bp);
-    bp = split(bp);
-    return bp;
-}
-
-/*
- * 
- */
-static void insert_freenode(void *node)
-{
-    if(BLOCK_SIZE(node) <= CACHED_SIZE) {
-        /* free blocks smaller than CACHED_SIZE bytes will be stored 
-         * in segregated lists rather than the red black tree */
-        void *header = getheader(BLOCK_SIZE(node));
-        NEXT_FREE(node) = NEXT_FREE(header);
-        if(NEXT_FREE(node) != 0) {
-            PREV_FREE(getbp(NEXT_FREE(node))) = getoffset(node);
-        }
-        NEXT_FREE(header) = getoffset(node);
-        PREV_FREE(node) = getoffset(header);
-    } else {
-        free_blocks_tree = insertAA(free_blocks_tree, node);
-        setcolor(free_blocks_tree, BLACK);
-    }
-}
-
-static void place(void *bp, size_t size)
-{
-    size_t csize = BLOCK_SIZE(bp);
-    int prev_used = GET_PREVUSED(HDRP(bp));
-    if(csize - size >= MINIMAL_BLOCKSIZE) {
-        PUT(HDRP(bp), PACK3(size, prev_used, 0, 1));
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK3(csize - size, 1, 0, 0));
-        PUT(FTRP(bp), PACK(csize - size, 0, 0));
-        LEFT_CHILD(bp) = 0;
-        RIGHT_CHILD(bp) = 0;
-        insert_freenode(bp);
-    } else {
-        PUT(HDRP(bp), PACK3(csize, prev_used, 0, 1));
-        setprevused(NEXT_BLKP(bp), 1);
-    }
-}
-
-/*
- * Coalesce adjacent free blocks.
- */
-static void* coalesce(void *bp)
-{
-    void *prev;
-    void *next;
-    size_t size = BLOCK_SIZE(bp);
-    if(GET_PREVUSED(HDRP(bp)) == 0) {
-        prev = PREV_BLKP(bp);
-        remove_freenode(prev);
-        size += BLOCK_SIZE(prev);
-        int prev_used = GET_PREVUSED(HDRP(prev));
-        PUT(HDRP(prev), PACK3(size, prev_used, 0, 0));
-        PUT(FTRP(prev), PACK(size, 0, 0));
-        bp = prev;
-    }
-    next = NEXT_BLKP(bp);
-    if(GET_ALLOC(HDRP(next)) == 0) {
-        remove_freenode(next);
-        size += BLOCK_SIZE(next);
-        int prev_used = GET_PREVUSED(HDRP(bp));
-        PUT(HDRP(bp), PACK3(size, prev_used, 0, 0));
-        PUT(FTRP(bp), PACK(size, 0, 0));
-    }
-    return bp;
-}
-
-/*
- * Decrease the level of root.
- * Child nodes may need repainted.
+ * Decrease_level: Decrease the level of root. Child nodes may need repainted.
  */
 static inline void decrease_level(void *rt, int dir)
 {
@@ -348,6 +289,27 @@ static inline void decrease_level(void *rt, int dir)
         }
         setcolor(rc, RED);
     }
+}
+
+/*
+ * Insert nodep into the AA tree and maintain the AA properties.
+ */
+static void* insert_aa_node(void* bp, void* nodep)
+{
+    if(bp == nullnode) {
+        /* set two children point to the nullnode */
+        *(long*)nodep = 0;
+        setcolor(nodep, RED);
+        return nodep;
+    }
+    if(lefter(nodep, bp)) {
+        LEFT_CHILD(bp) = getoffset(insert_aa_node(getbp(LEFT_CHILD(bp)), nodep));
+    } else {
+        RIGHT_CHILD(bp) = getoffset(insert_aa_node(getbp(RIGHT_CHILD(bp)), nodep));
+    }
+    bp = skew(bp);
+    bp = split(bp);
+    return bp;
 }
 
 /*
@@ -366,7 +328,7 @@ static void* remove_aa_leaf(void *root, void *node, int *level_diff)
         return nullnode;
     } else {
         int dir;
-        dir = LEFTER(node, root) ? L : R;
+        dir = lefter(node, root) ? L : R;
         int old_color = BLOCK_COLOR(getbp(CHILD(root, dir)));
         CHILD(root, dir) = getoffset(remove_aa_leaf(getbp(CHILD(root, dir)), node, level_diff));
         if(*level_diff == 0) {
@@ -403,7 +365,7 @@ static void* remove_aa_leaf(void *root, void *node, int *level_diff)
 static void* replace(void *root, void *old, void *neew)
 {
     void *oldroot = root;
-    freenode_offset *prt_Pointer = NULL;
+    offset *prt_Pointer = NULL;
     while(root != nullnode) {
         if(root == old) {
             LEFT_CHILD(neew) = LEFT_CHILD(old);
@@ -415,7 +377,7 @@ static void* replace(void *root, void *old, void *neew)
                 *prt_Pointer = getoffset(neew);
             }
             return oldroot;
-        } else if(LEFTER(old, root)) {
+        } else if(lefter(old, root)) {
             prt_Pointer = & LEFT_CHILD(root);
             root = getbp(LEFT_CHILD(root));
         } else {
@@ -431,7 +393,7 @@ static void* replace(void *root, void *old, void *neew)
 /*
  * Helper function for getting the left most node of the search tree
  */
-static void* get_leftmost_node( void *root, freenode_offset **prtPointer)
+static void* get_leftmost_node( void *root, offset **prtPointer)
 {
     while(LEFT_CHILD(root) != 0) {
         *prtPointer = &LEFT_CHILD(root);
@@ -439,11 +401,87 @@ static void* get_leftmost_node( void *root, freenode_offset **prtPointer)
     }
     return root;
 }
+/******************************************************************************/
+
 
 /*
- * 
+ * add_freeblock
  */
-static void remove_freenode(void* nodebp)
+static void add_freeblock(void *node)
+{
+    if(BLOCK_SIZE(node) <= CACHED_SIZE) {
+        /* free blocks smaller than CACHED_SIZE bytes will be stored 
+         * in segregated lists rather than the red black tree */
+        void *header = getheader(BLOCK_SIZE(node));
+        NEXT_FREE(node) = NEXT_FREE(header);
+        if(NEXT_FREE(node) != 0) {
+            PREV_FREE(getbp(NEXT_FREE(node))) = getoffset(node);
+        }
+        NEXT_FREE(header) = getoffset(node);
+        PREV_FREE(node) = getoffset(header);
+    } else {
+        free_blocks_tree = insert_aa_node(free_blocks_tree, node);
+        setcolor(free_blocks_tree, BLACK);
+    }
+}
+
+/*
+ * place: place a block in the block pointed by bp.
+ * If the remaining space is large enough, using the remaining
+ * space as a free block.
+ */
+static void place(void *bp, size_t size)
+{
+    size_t csize = BLOCK_SIZE(bp);
+    int prev_used = GET_PREVUSED(HDRP(bp));
+    if(csize - size >= MINIMAL_BLOCKSIZE) {
+        PUT(HDRP(bp), PACK3(size, prev_used, 0, 1));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK3(csize - size, 1, 0, 0));
+        PUT(FTRP(bp), PACK(csize - size, 0, 0));
+        LEFT_CHILD(bp) = 0;
+        RIGHT_CHILD(bp) = 0;
+        add_freeblock(bp);
+    } else {
+        PUT(HDRP(bp), PACK3(csize, prev_used, 0, 1));
+        setprevused(NEXT_BLKP(bp), 1);
+    }
+}
+
+/*
+ * Coalesce adjacent free blocks.
+ */
+static void* coalesce(void *bp)
+{
+    void *prev;
+    void *next;
+    size_t size = BLOCK_SIZE(bp);
+    if(GET_PREVUSED(HDRP(bp)) == 0) {
+        prev = PREV_BLKP(bp);
+        remove_freeblock(prev);
+        size += BLOCK_SIZE(prev);
+        int prev_used = GET_PREVUSED(HDRP(prev));
+        PUT(HDRP(prev), PACK3(size, prev_used, 0, 0));
+        PUT(FTRP(prev), PACK(size, 0, 0));
+        bp = prev;
+    }
+    next = NEXT_BLKP(bp);
+    if(GET_ALLOC(HDRP(next)) == 0) {
+        remove_freeblock(next);
+        size += BLOCK_SIZE(next);
+        int prev_used = GET_PREVUSED(HDRP(bp));
+        PUT(HDRP(bp), PACK3(size, prev_used, 0, 0));
+        PUT(FTRP(bp), PACK(size, 0, 0));
+    }
+    return bp;
+}
+
+
+
+/*
+ * remove_freeblock
+ */
+static void remove_freeblock(void* nodebp)
 {
     if(BLOCK_SIZE(nodebp) <= CACHED_SIZE) {
         void *prev = getbp(PREV_FREE(nodebp));
@@ -458,7 +496,7 @@ static void remove_freenode(void* nodebp)
             free_blocks_tree = remove_aa_leaf(free_blocks_tree, nodebp, &tmp);
             setcolor(free_blocks_tree, BLACK);
         } else {
-            freenode_offset *succ_parent = &RIGHT_CHILD(nodebp);
+            offset *succ_parent = &RIGHT_CHILD(nodebp);
             void *succ = get_leftmost_node(getbp(RIGHT_CHILD(nodebp)), &succ_parent);
             if(RIGHT_CHILD(succ) == 0) {
                 if(BLOCK_COLOR(succ) == RED) {
@@ -506,7 +544,7 @@ void *malloc (size_t size) {
         if(bp == NULL)
             return NULL;
     } else {
-        remove_freenode(bp);
+        remove_freeblock(bp);
     }
     place(bp, asize);
     return bp;
@@ -528,7 +566,7 @@ void free(void *ptr) {
     ptr = coalesce(ptr);
     LEFT_CHILD(ptr) = 0;
     RIGHT_CHILD(ptr) = 0;
-    insert_freenode(ptr);
+    add_freeblock(ptr);
 }
 
 /*
@@ -585,23 +623,8 @@ void *calloc (size_t nmemb, size_t size) {
 
 
 /*
- * Return whether the pointer is in the heap.
- * May be useful for debugging.
- */
-static int in_heap(const void *p) {
-    return p <= mem_heap_hi() && p >= mem_heap_lo();
-}
-
-/*
- * Return whether the pointer is aligned.
- * May be useful for debugging.
- */
-static int aligned(const void *p) {
-    return (size_t)ALIGN(p) == (size_t)p;
-}
-
-/*
  * mm_checkheap
  */
 void mm_checkheap(int verbose) {
+    verbose = verbose;
 }
