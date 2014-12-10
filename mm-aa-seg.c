@@ -672,7 +672,7 @@ void check_freeblocks_tree(void *node)
 
 void check_freeblocks()
 {
-    int size;
+    size_t size;
     for(size = MINIMAL_BLOCKSIZE; size <= CACHED_SIZE; size+=DSIZE) {
         void *node = getheader(size);
         node = getbp(NEXT_FREE(node));
