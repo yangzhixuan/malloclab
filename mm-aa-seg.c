@@ -49,6 +49,11 @@
 /* rounds up to the nearest multiple of ALIGNMENT */
 #define ALIGN(p) (((size_t)(p) + (ALIGNMENT-1)) & ~0x7)
 
+/* forward declarations and type definitions */
+static void *coalesce(void *bp);
+static void remove_freeblock(void* node);
+typedef unsigned int offset;
+
 /* helper macros for manipulating block pointers */
 #define WSIZE 4
 #define DSIZE 8
@@ -66,7 +71,9 @@
 #define GET_PREVUSED(p) ((GET(p) >> 2) & 1)
 #define HDRP(bp) ((char*)(bp) - WSIZE)
 #define FTRP(bp) ((char*)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)
+#define BLOCK_PREVUSED(bp) (GET_PREVUSED(HDRP(bp)))
 #define BLOCK_SIZE(bp) (GET_SIZE(HDRP(bp)))
+#define BLOCK_ALLOC(bp) (GET_ALLOC(HDRP(bp)))
 #define BLOCK_COLOR(bp) (GET_COLOR(HDRP(bp)))
 #define LEFT_CHILD(bp) (GET(bp))
 #define RIGHT_CHILD(bp) (GET((char*)(bp) + WSIZE))
@@ -79,18 +86,6 @@
 #define R (1)
 #define BLACK (0)
 #define RED (1)
-
-/*
- * Determine the order of blocks in the tree.
- * Compare the address if the blocks have the same size so that different blocks
- * have different keys.
- */
-inline static int lefter(void *b1, void *b2)
-{
-    return (BLOCK_SIZE(b1) < BLOCK_SIZE(b2))
-        || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && (b1) < (b2));
-}
-
 inline static void setcolor(void *bp, int color)
 {
      *HDRP(bp) = ((*HDRP(bp)) & (~2)) | (color << 1);
@@ -101,16 +96,11 @@ inline static void setprevused(void *bp, int used)
      *HDRP(bp) = ((*HDRP(bp)) & (~4)) | (used << 2);
 }
 
-/* forward declarations and type definitions */
-static void *coalesce(void *bp);
-typedef unsigned int offset;
-static void remove_freeblock(void* node);
-
-
 /* pointer to the first (by address order) block (the prologue block) of the heap */
 static void* heap_start;
 static void* nullnode;
 static void* lists_header;
+static void* first_block;
 static void* epilogue;
 /* root node of the free block binary search tree */
 static void* free_blocks_tree;
@@ -133,13 +123,17 @@ static inline offset getoffset(void* bp)
  */
 static inline void* getheader(int size)
 {
+#ifdef DEBUG
+    assert(size % DSIZE == 0);
+#endif
     return lists_header + (size - MINIMAL_BLOCKSIZE) / (DSIZE / WSIZE);
 }
 
 /*
  * Initialize: return -1 on error, 0 on success.
  */
-int mm_init(void) {
+int mm_init(void) 
+{
     int i, a_classes = CACHED_CLASSES;
 
     /* make sure CACHED_CLASSES is odd to satisfy the align requirement */
@@ -164,7 +158,7 @@ int mm_init(void) {
         PUT(lists_header + i * WSIZE, 0);
     }
 
-    epilogue = heap_start + (4 + a_classes + 1) * WSIZE;
+    first_block = epilogue = heap_start + (4 + a_classes + 1) * WSIZE;
     PUT(HDRP(epilogue), PACK3(0, 1, 0, 1));
 
     return 0;
@@ -229,6 +223,18 @@ static void* find_fit(size_t size)
 
 /***************************** AA tree functions ******************************/
 /******************************************************************************/
+
+/*
+ * Determine the order of blocks in the tree.
+ * Compare the address if the blocks have the same size so that different blocks
+ * have different keys.
+ */
+inline static int lefter(void *b1, void *b2)
+{
+    return (BLOCK_SIZE(b1) < BLOCK_SIZE(b2))
+        || (BLOCK_SIZE(b1) == BLOCK_SIZE(b2) && (b1) < (b2));
+}
+
 /*
  * Binary search tree rotation. Arguments l stands for the direction.
  * When l is L, rotate the left son.
@@ -362,7 +368,7 @@ static void* remove_aa_leaf(void *root, void *node, int *level_diff)
 /*
  * Replace the old node in the tree with the new one.
  */
-static void* replace(void *root, void *old, void *neew)
+static void* replace_node(void *root, void *old, void *neew)
 {
     void *oldroot = root;
     offset *prt_Pointer = NULL;
@@ -509,7 +515,7 @@ static void remove_freeblock(void* nodebp)
                 *succ_parent = RIGHT_CHILD(succ);
                 setcolor(getbp(RIGHT_CHILD(succ)), BLACK);
             }
-            free_blocks_tree = replace(free_blocks_tree, nodebp, succ);
+            free_blocks_tree = replace_node(free_blocks_tree, nodebp, succ);
         }
     }
 }
@@ -517,7 +523,8 @@ static void remove_freeblock(void* nodebp)
 /*
  * malloc
  */
-void *malloc (size_t size) {
+void *malloc (size_t size) 
+{
     size_t asize;
     size_t extendsize;
     void *bp;
@@ -553,7 +560,8 @@ void *malloc (size_t size) {
 /*
  * free
  */
-void free(void *ptr) {
+void free(void *ptr) 
+{
     if(ptr == NULL)
         return;
 
@@ -572,7 +580,8 @@ void free(void *ptr) {
 /*
  * realloc - you may want to look at mm-naive.c
  */
-void *realloc(void *oldptr, size_t size) {
+void *realloc(void *oldptr, size_t size)
+{
     size_t oldsize;
     void *newptr;
 
@@ -611,7 +620,8 @@ void *realloc(void *oldptr, size_t size) {
  * This function is not tested by mdriver, but it is
  * needed to run the traces.
  */
-void *calloc (size_t nmemb, size_t size) {
+void *calloc (size_t nmemb, size_t size) 
+{
     size_t bytes = nmemb * size;
     void *newptr;
 
@@ -623,8 +633,128 @@ void *calloc (size_t nmemb, size_t size) {
 
 
 /*
- * mm_checkheap
+ * Functions for testing. See the comment of mm_checkheap() for details.
+ *
  */
-void mm_checkheap(int verbose) {
-    verbose = verbose;
+static int free_blocks_in_implicit_list;
+static int free_blocks_in_lists_tree;
+
+void check_implicit_list()
+{
+    assert(mem_heap_hi() + 1 == epilogue);
+    void *block = first_block;
+    while(block != epilogue) {
+        assert(BLOCK_SIZE(block) % DSIZE == 0);
+        if(BLOCK_ALLOC(block) == 1) {
+            assert(BLOCK_PREVUSED(NEXT_BLKP(block)) == 1);
+        } else {
+            free_blocks_in_implicit_list += 1;
+            assert(BLOCK_PREVUSED(NEXT_BLKP(block)) == 0);
+            assert(BLOCK_ALLOC(NEXT_BLKP(block)) == 1);
+            assert(GET_SIZE(FTRP(block)) == BLOCK_SIZE(block));
+            assert(GET_ALLOC(FTRP(block)) == BLOCK_ALLOC(block));
+        }
+        block = NEXT_BLKP(block);
+    }
+    assert(BLOCK_SIZE(block) == 0);
+    assert(BLOCK_ALLOC(block) == 1);
+}
+
+void check_freeblocks_tree(void *node)
+{
+    if(node == nullnode)
+        return;
+    free_blocks_in_lists_tree += 1;
+    assert(BLOCK_ALLOC(node) == 0);
+    check_freeblocks_tree(getbp(LEFT_CHILD(node)));
+    check_freeblocks_tree(getbp(RIGHT_CHILD(node)));
+}
+
+void check_freeblocks()
+{
+    int size;
+    for(size = MINIMAL_BLOCKSIZE; size <= CACHED_SIZE; size+=DSIZE) {
+        void *node = getheader(size);
+        node = getbp(NEXT_FREE(node));
+        while(node != nullnode) {
+            free_blocks_in_lists_tree += 1;
+            assert(BLOCK_SIZE(node) == size);
+            assert(BLOCK_ALLOC(node) == 0);
+            node = getbp(NEXT_FREE(node));
+        }
+    }
+    check_freeblocks_tree(free_blocks_tree);
+    assert(free_blocks_in_implicit_list == free_blocks_in_lists_tree);
+}
+
+static void* predecessor_in_tree;
+void check_aa_ordered(void *node)
+{
+    if(node == nullnode)
+        return;
+    check_aa_ordered(getbp(LEFT_CHILD(node)));
+    assert(lefter(predecessor_in_tree, node));
+    predecessor_in_tree = node;
+    check_aa_ordered(getbp(RIGHT_CHILD(node)));
+
+}
+
+int black_height(void *bp)
+{
+    if(bp == nullnode)
+        return 0;
+    return black_height(getbp(LEFT_CHILD(bp))) 
+        + (BLOCK_COLOR(bp) == BLACK);
+}
+
+void check_aa_properties(void *node)
+{
+    if(node == nullnode) {
+        assert(BLOCK_COLOR(node) == BLACK);
+        return;
+    }
+
+    void *lc = getbp(LEFT_CHILD(node));
+    void *rc = getbp(RIGHT_CHILD(node));
+    check_aa_properties(lc);
+    check_aa_properties(rc);
+    if(BLOCK_COLOR(node) == RED) {
+        assert(BLOCK_COLOR(lc) == BLACK);
+        assert(BLOCK_COLOR(rc) == BLACK);
+    } else {
+        assert(BLOCK_COLOR(lc) == BLACK);
+    }
+    assert(black_height(lc) == black_height(rc));
+}
+
+void check_tree_properties()
+{
+    predecessor_in_tree = nullnode;
+    check_aa_ordered(free_blocks_tree);
+    check_aa_properties(free_blocks_tree);
+}
+
+/*
+ * mm_checkheap: check the consistency of the heap.
+ * Checked invariants including:
+ * 1. (verbose >= 1) All blocks form an implicit list terminated by the epilogue.
+ * 2. (verbose >= 1) PREV_USED tags are correctly maintained in the implicit list.
+ * 3. (verbose >= 2) Every block in the segregated lists or the tree is a free block.
+ * 4. (verbose >= 2) The number of free blocks in the implicit list matches with
+ *                   the number of blocks in the lists or the tree.
+ * 5. (verbose >= 2) The size of every block in a list equals to the size corresponded to the list.
+ * 6. (verbose >= 3) The AA properties hold for the AA tree.
+ */
+void mm_checkheap(int verbose) 
+{
+    free_blocks_in_implicit_list = free_blocks_in_lists_tree = 0;
+    if(verbose >= 1) {
+        check_implicit_list();
+    }
+    if(verbose >= 2) {
+        check_freeblocks();
+    }
+    if(verbose >= 3) {
+        check_tree_properties();
+    }
 }
